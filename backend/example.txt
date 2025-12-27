@@ -1,0 +1,259 @@
+from fastapi import FastAPI, File, UploadFile
+import mediapipe as mp
+import numpy as np
+import cv2
+from io import BytesIO
+import math
+
+app = FastAPI()
+
+# Initialize MediaPipe
+BaseOptions = mp.tasks.BaseOptions
+PoseLandmarker = mp.tasks.vision.PoseLandmarker
+PoseLandmarkerOptions = mp.tasks.vision.PoseLandmarkerOptions
+VisionRunningMode = mp.tasks.vision.RunningMode
+
+model_path = "model/pose_landmarker_full.task"
+
+options = PoseLandmarkerOptions(
+    base_options=BaseOptions(model_asset_path=model_path),
+    running_mode=VisionRunningMode.IMAGE,
+)
+
+landmarker = PoseLandmarker.create_from_options(options)
+
+
+def calculate_distance(point1, point2):
+    """Calculate Euclidean distance between two 3D points"""
+    x_diff = point2.x - point1.x
+    y_diff = point2.y - point1.y
+    z_diff = point2.z - point1.z
+    
+    distance = math.sqrt(x_diff**2 + y_diff**2 + z_diff**2)
+    return distance
+
+
+def extract_measurements(landmarks):
+    """Extract key measurements from landmarks"""
+    
+    # Landmark indices from MediaPipe
+    LEFT_SHOULDER = 11
+    RIGHT_SHOULDER = 12
+    LEFT_ELBOW = 13
+    RIGHT_ELBOW = 14
+    LEFT_WRIST = 15
+    RIGHT_WRIST = 16
+    LEFT_HIP = 23
+    RIGHT_HIP = 24
+    LEFT_KNEE = 25
+    RIGHT_KNEE = 26
+    LEFT_ANKLE = 27
+    RIGHT_ANKLE = 28
+    NOSE = 0
+    
+    measurements = {}
+    
+    # Check if landmarks are detected
+    if not landmarks or len(landmarks) == 0:
+        return None
+    
+    try:
+        # Shoulder width (distance between left and right shoulder)
+        left_shoulder = landmarks[LEFT_SHOULDER]
+        right_shoulder = landmarks[RIGHT_SHOULDER]
+        shoulder_width = calculate_distance(left_shoulder, right_shoulder)
+        measurements['shoulder_width_m'] = shoulder_width
+        measurements['shoulder_width_cm'] = shoulder_width * 100
+        
+        # Right sleeve length (shoulder to wrist)
+        right_shoulder = landmarks[RIGHT_SHOULDER]
+        right_wrist = landmarks[RIGHT_WRIST]
+        right_sleeve = calculate_distance(right_shoulder, right_wrist)
+        measurements['right_sleeve_length_m'] = right_sleeve
+        measurements['right_sleeve_length_cm'] = right_sleeve * 100
+        
+        # Left sleeve length
+        left_shoulder = landmarks[LEFT_SHOULDER]
+        left_wrist = landmarks[LEFT_WRIST]
+        left_sleeve = calculate_distance(left_shoulder, left_wrist)
+        measurements['left_sleeve_length_m'] = left_sleeve
+        measurements['left_sleeve_length_cm'] = left_sleeve * 100
+        
+        # Hip width
+        left_hip = landmarks[LEFT_HIP]
+        right_hip = landmarks[RIGHT_HIP]
+        hip_width = calculate_distance(left_hip, right_hip)
+        measurements['hip_width_m'] = hip_width
+        measurements['hip_width_cm'] = hip_width * 100
+        
+        # Torso length (shoulder to hip)
+        right_shoulder = landmarks[RIGHT_SHOULDER]
+        right_hip = landmarks[RIGHT_HIP]
+        torso_length = calculate_distance(right_shoulder, right_hip)
+        measurements['torso_length_m'] = torso_length
+        measurements['torso_length_cm'] = torso_length * 100
+        
+        # Arm length (shoulder to elbow)
+        right_shoulder = landmarks[RIGHT_SHOULDER]
+        right_elbow = landmarks[RIGHT_ELBOW]
+        arm_length = calculate_distance(right_shoulder, right_elbow)
+        measurements['right_arm_length_m'] = arm_length
+        measurements['right_arm_length_cm'] = arm_length * 100
+        
+        # Height (nose to ankle)
+        nose = landmarks[NOSE]
+        right_ankle = landmarks[RIGHT_ANKLE]
+        height = calculate_distance(nose, right_ankle)
+        measurements['height_m'] = height
+        measurements['height_cm'] = height * 100
+        
+        return measurements
+        
+    except Exception as e:
+        return None
+
+
+@app.get("/")
+async def root():
+    return {"message": "SmartTailor API is running", "status": "ready"}
+
+
+@app.post("/measure")
+async def measure_body(file: UploadFile = File(...)):
+    """
+    Endpoint to measure body from uploaded image
+    
+    Returns measurements in both meters and centimeters
+    """
+    
+    try:
+        # Read the uploaded image
+        image_data = await file.read()
+        nparr = np.frombuffer(image_data, np.uint8)
+        image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        # Convert BGR to RGB for MediaPipe
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Create MediaPipe Image object
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
+        
+        # Run pose detection
+        detection_result = landmarker.detect(mp_image)
+        
+        # Check if pose was detected
+        if not detection_result.pose_landmarks:
+            return {
+                "status": "error",
+                "message": "No body detected in image",
+                "measurements": None
+            }
+        
+        # Extract landmarks from first detected pose
+        landmarks = detection_result.pose_landmarks[0]
+        
+        # Calculate measurements
+        measurements = extract_measurements(landmarks)
+        
+        if measurements is None:
+            return {
+                "status": "error",
+                "message": "Could not extract measurements",
+                "measurements": None
+            }
+        
+        return {
+            "status": "success",
+            "message": "Measurements extracted successfully",
+            "measurements": measurements
+        }
+        
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Error processing image: {str(e)}",
+            "measurements": None
+        }
+
+
+@app.post("/measure-with-calibration")
+async def measure_body_with_calibration(
+    file: UploadFile = File(...),
+    calibration_object_pixels: float = 100,
+    calibration_object_cm: float = 10
+):
+    """
+    Endpoint to measure body with pixel calibration
+    
+    Use this if you want to calibrate using a reference object (A4 paper, etc)
+    
+    calibration_object_pixels: width of reference object in pixels
+    calibration_object_cm: actual width of reference object in cm
+    """
+    
+    try:
+        # Read the uploaded image
+        image_data = await file.read()
+        nparr = np.frombuffer(image_data, np.uint8)
+        image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        # Convert BGR to RGB for MediaPipe
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Create MediaPipe Image object
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
+        
+        # Run pose detection
+        detection_result = landmarker.detect(mp_image)
+        
+        # Check if pose was detected
+        if not detection_result.pose_landmarks:
+            return {
+                "status": "error",
+                "message": "No body detected in image",
+                "measurements": None
+            }
+        
+        # Extract landmarks
+        landmarks = detection_result.pose_landmarks[0]
+        
+        # Calculate measurements (these are in meters from world coordinates)
+        measurements = extract_measurements(landmarks)
+        
+        if measurements is None:
+            return {
+                "status": "error",
+                "message": "Could not extract measurements",
+                "measurements": None
+            }
+        
+        # Apply calibration factor if provided
+        if calibration_object_pixels and calibration_object_cm:
+            calibration_factor = calibration_object_cm / calibration_object_pixels
+            
+            # Adjust measurements based on calibration
+            for key in measurements.keys():
+                if 'cm' in key:
+                    # Recalculate with calibration
+                    meter_key = key.replace('_cm', '_m')
+                    if meter_key in measurements:
+                        measurements[key] = measurements[meter_key] * 100 * calibration_factor
+        
+        return {
+            "status": "success",
+            "message": "Measurements extracted with calibration",
+            "measurements": measurements,
+            "calibration_applied": True
+        }
+        
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Error processing image: {str(e)}",
+            "measurements": None
+        }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
