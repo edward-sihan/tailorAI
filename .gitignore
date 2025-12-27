@@ -1,0 +1,7 @@
+backend/.venv
+backend/src/__pycache__
+backend/.env
+backend/.DS_Store
+.DS_Store
+backend/image/IMG_5837.JPG
+backend/image/example.png
